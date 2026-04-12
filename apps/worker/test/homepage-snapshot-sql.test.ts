@@ -5,10 +5,45 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { publicHomepageResponseSchema } from '../src/schemas/public-homepage';
+import { computePublicStatusPayload } from '../src/public/status';
+import {
+  homepageFromStatusPayload,
+  readHomepageHistoryPreviews,
+} from '../src/public/homepage';
 import { __testOnly_homepageDataSnapshotSql } from '../src/snapshots/public-homepage';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
+
+function createD1FromSqlite(db: DatabaseSync): D1Database {
+  return {
+    prepare(sql: string) {
+      let boundArgs: unknown[] = [];
+      const stmt = db.prepare(sql);
+
+      const api = {
+        bind(...args: unknown[]) {
+          boundArgs = args;
+          return api;
+        },
+        async first<T>(): Promise<T | null> {
+          const row = stmt.get(...boundArgs) as T | undefined;
+          return row ?? null;
+        },
+        async all<T>(): Promise<{ results: T[] }> {
+          const rows = stmt.all(...boundArgs) as T[] | undefined;
+          return { results: rows ?? [] };
+        },
+        async run(): Promise<{ meta: { changes: number } }> {
+          const result = stmt.run(...boundArgs) as { changes?: number } | undefined;
+          return { meta: { changes: result?.changes ?? 0 } };
+        },
+      };
+
+      return api;
+    },
+  } as unknown as D1Database;
+}
 
 function applyMigrations(db: DatabaseSync): void {
   const migrationsDir = join(process.cwd(), 'migrations');
@@ -152,33 +187,42 @@ function seedScenario(db: DatabaseSync, now: number): void {
   db.prepare(
     `
       INSERT INTO incidents (id, title, status, impact, message, started_at, resolved_at)
-      VALUES (1, 'Major Outage', 'investigating', 'major', 'Investigating', ?1, NULL)
+      VALUES
+        (1, 'Incident 1', 'investigating', 'minor', 'Investigating', ?1, NULL),
+        (2, 'Incident 2', 'investigating', 'none', 'Investigating', ?2, NULL),
+        (3, 'Incident 3', 'investigating', 'minor', 'Investigating', ?3, NULL),
+        (4, 'Incident 4', 'investigating', 'major', 'Investigating', ?4, NULL),
+        (5, 'Incident 5', 'investigating', 'critical', 'Investigating', ?5, NULL),
+        (6, 'Incident 6', 'investigating', 'minor', 'Investigating', ?6, NULL),
+        (7, 'Incident 7', 'investigating', 'none', 'Investigating', ?7, NULL)
     `,
-  ).run(now - 1200);
-  db.prepare(
-    `
-      INSERT INTO incident_monitors (incident_id, monitor_id)
-      VALUES (1, 1)
-    `,
-  ).run();
+  ).run(
+    now - 2000 + 1,
+    now - 2000 + 2,
+    now - 2000 + 3,
+    now - 2000 + 4,
+    now - 2000 + 5,
+    now - 2000 + 6,
+    now - 2000 + 7,
+  );
 
   // Resolved incident previews: one visible (no links), one hidden-only
   db.prepare(
     `
       INSERT INTO incidents (id, title, status, impact, message, started_at, resolved_at)
-      VALUES (2, 'Minor Issue', 'resolved', 'minor', 'Resolved', ?1, ?2)
+      VALUES (20, 'Minor Issue', 'resolved', 'minor', 'Resolved', ?1, ?2)
     `,
   ).run(now - 20_000, now - 19_000);
   db.prepare(
     `
       INSERT INTO incidents (id, title, status, impact, message, started_at, resolved_at)
-      VALUES (3, 'Hidden Issue', 'resolved', 'critical', 'Hidden', ?1, ?2)
+      VALUES (21, 'Hidden Issue', 'resolved', 'critical', 'Hidden', ?1, ?2)
     `,
   ).run(now - 30_000, now - 29_000);
   db.prepare(
     `
       INSERT INTO incident_monitors (incident_id, monitor_id)
-      VALUES (3, 4)
+      VALUES (21, 4)
     `,
   ).run();
 }
@@ -208,12 +252,69 @@ describe('homepage snapshot SQL refresh', () => {
 
     const parsed = JSON.parse(row?.body_json ?? 'null') as unknown;
     const validated = publicHomepageResponseSchema.parse(parsed);
+    const todayStartAt = Math.floor(now / 86_400) * 86_400;
 
     expect(validated.generated_at).toBe(now);
     expect(validated.monitors.length).toBe(3);
     expect(validated.monitors.find((m) => m.id === 3)?.is_stale).toBe(true);
     expect(validated.banner.source).toBe('incident');
+    expect(validated.banner.status).toBe('major_outage');
+    expect(validated.banner.incident?.id).toBe(7);
+    expect(validated.active_incidents.map((it) => it.id)).toEqual([7, 6, 5, 4, 3]);
+    for (const monitor of validated.monitors) {
+      expect(monitor.uptime_day_strip.day_start_at.at(-1)).toBe(todayStartAt);
+    }
     expect(validated.maintenance_history_preview?.title).toBe('Past Maint');
     expect(validated.resolved_incident_preview?.title).toBe('Minor Issue');
+
+    const d1 = createD1FromSqlite(db);
+    return Promise.all([
+      computePublicStatusPayload(d1, now),
+      readHomepageHistoryPreviews(d1, now),
+    ]).then(([statusPayload, previews]) => {
+      const expected = publicHomepageResponseSchema.parse(
+        homepageFromStatusPayload(statusPayload, previews),
+      );
+
+      expect(validated.generated_at).toBe(expected.generated_at);
+      expect(validated.monitor_count_total).toBe(expected.monitor_count_total);
+      expect(validated.site_title).toBe(expected.site_title);
+      expect(validated.site_description).toBe(expected.site_description);
+      expect(validated.site_locale).toBe(expected.site_locale);
+      expect(validated.site_timezone).toBe(expected.site_timezone);
+      expect(validated.uptime_rating_level).toBe(expected.uptime_rating_level);
+      expect(validated.overall_status).toBe(expected.overall_status);
+      expect(validated.banner).toEqual(expected.banner);
+      expect(validated.summary).toEqual(expected.summary);
+      expect(validated.active_incidents).toEqual(expected.active_incidents);
+      expect(validated.maintenance_windows).toEqual(expected.maintenance_windows);
+      expect(validated.resolved_incident_preview).toEqual(expected.resolved_incident_preview);
+      expect(validated.maintenance_history_preview).toEqual(expected.maintenance_history_preview);
+
+      expect(validated.monitors.length).toBe(expected.monitors.length);
+      for (let index = 0; index < validated.monitors.length; index += 1) {
+        const actualMonitor = validated.monitors[index];
+        const expectedMonitor = expected.monitors[index];
+        expect(actualMonitor?.id).toBe(expectedMonitor?.id);
+        expect(actualMonitor?.name).toBe(expectedMonitor?.name);
+        expect(actualMonitor?.type).toBe(expectedMonitor?.type);
+        expect(actualMonitor?.group_name).toBe(expectedMonitor?.group_name);
+        expect(actualMonitor?.status).toBe(expectedMonitor?.status);
+        expect(actualMonitor?.is_stale).toBe(expectedMonitor?.is_stale);
+        expect(actualMonitor?.last_checked_at).toBe(expectedMonitor?.last_checked_at);
+        expect(actualMonitor?.heartbeat_strip).toEqual(expectedMonitor?.heartbeat_strip);
+        expect(actualMonitor?.uptime_day_strip).toEqual(expectedMonitor?.uptime_day_strip);
+
+        if (actualMonitor?.uptime_30d === null || expectedMonitor?.uptime_30d === null) {
+          expect(actualMonitor?.uptime_30d).toBeNull();
+          expect(expectedMonitor?.uptime_30d).toBeNull();
+        } else {
+          expect(actualMonitor?.uptime_30d.uptime_pct).toBeCloseTo(
+            expectedMonitor?.uptime_30d.uptime_pct ?? 0,
+            6,
+          );
+        }
+      }
+    });
   });
 });
