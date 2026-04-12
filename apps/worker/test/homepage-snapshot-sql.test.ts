@@ -15,11 +15,36 @@ import { __testOnly_homepageDataSnapshotSql } from '../src/snapshots/public-home
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
 
+function toSqlLiteral(value: unknown): string {
+  if (value === null || value === undefined) return 'NULL';
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      throw new TypeError(`Non-finite SQL number: ${value}`);
+    }
+    return String(value);
+  }
+  if (typeof value === 'bigint') return value.toString();
+  if (typeof value === 'boolean') return value ? '1' : '0';
+  const text = String(value);
+  return `'${text.replace(/'/g, "''")}'`;
+}
+
+function interpolateSql(sql: string, args: unknown[]): string {
+  let anonymousIndex = 0;
+  return sql.replace(/\?(\d+)?/g, (_match, digits: string | undefined) => {
+    const index = digits ? Number.parseInt(digits, 10) - 1 : anonymousIndex++;
+    const value = args[index];
+    if (index < 0 || index >= args.length) {
+      throw new RangeError(`Missing SQL bind param at index ${index + 1}`);
+    }
+    return toSqlLiteral(value);
+  });
+}
+
 function createD1FromSqlite(db: DatabaseSync): D1Database {
   return {
     prepare(sql: string) {
       let boundArgs: unknown[] = [];
-      const stmt = db.prepare(sql);
 
       const api = {
         bind(...args: unknown[]) {
@@ -27,15 +52,18 @@ function createD1FromSqlite(db: DatabaseSync): D1Database {
           return api;
         },
         async first<T>(): Promise<T | null> {
-          const row = stmt.get(...boundArgs) as T | undefined;
+          const expandedSql = boundArgs.length > 0 ? interpolateSql(sql, boundArgs) : sql;
+          const row = db.prepare(expandedSql).get() as T | undefined;
           return row ?? null;
         },
         async all<T>(): Promise<{ results: T[] }> {
-          const rows = stmt.all(...boundArgs) as T[] | undefined;
+          const expandedSql = boundArgs.length > 0 ? interpolateSql(sql, boundArgs) : sql;
+          const rows = db.prepare(expandedSql).all() as T[] | undefined;
           return { results: rows ?? [] };
         },
         async run(): Promise<{ meta: { changes: number } }> {
-          const result = stmt.run(...boundArgs) as { changes?: number } | undefined;
+          const expandedSql = boundArgs.length > 0 ? interpolateSql(sql, boundArgs) : sql;
+          const result = db.prepare(expandedSql).run() as { changes?: number } | undefined;
           return { meta: { changes: result?.changes ?? 0 } };
         },
       };
@@ -250,13 +278,15 @@ describe('homepage snapshot SQL refresh', () => {
     applyMigrations(db);
     seedScenario(db, now);
 
-    db.prepare(__testOnly_homepageDataSnapshotSql).run(
-      now,
-      'Uptimer',
-      '',
-      'auto',
-      'UTC',
-      3,
+    db.exec(
+      interpolateSql(__testOnly_homepageDataSnapshotSql, [
+        now,
+        'Uptimer',
+        '',
+        'auto',
+        'UTC',
+        3,
+      ]),
     );
 
     const row = db
